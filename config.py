@@ -11,8 +11,13 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6").strip()
+FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY", "").strip()
+FIREWORKS_BASE_URL = os.getenv(
+    "FIREWORKS_BASE_URL", "https://api.fireworks.ai/inference/v1"
+).strip()
+MODEL = os.getenv(
+    "MODEL", "accounts/fireworks/models/kimi-k2p6"
+).strip()
 
 # Список разрешённых Telegram ID (бот отвечает только им)
 _raw_ids = os.getenv("ALLOWED_USER_IDS", "").strip()
@@ -35,8 +40,8 @@ def validate() -> list[str]:
     problems = []
     if not TELEGRAM_BOT_TOKEN:
         problems.append("Не задан TELEGRAM_BOT_TOKEN в .env")
-    if not ANTHROPIC_API_KEY:
-        problems.append("Не задан ANTHROPIC_API_KEY в .env")
+    if not FIREWORKS_API_KEY:
+        problems.append("Не задан FIREWORKS_API_KEY в .env")
     if not ALLOWED_USER_IDS:
         problems.append("Не задан ALLOWED_USER_IDS в .env (твой Telegram ID)")
     return problems

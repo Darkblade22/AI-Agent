@@ -1,106 +1,125 @@
-"""Инструменты агента: память, файлы, напоминания.
+"""Инструменты агента: поиск в интернете, память, файлы, напоминания.
 
-Поиск в интернете подключается отдельно как серверный инструмент Anthropic
-(web_search) — см. agent.py. Здесь только "клиентские" инструменты,
-которые выполняются на нашей стороне.
+Формат описаний — OpenAI function calling (Fireworks его поддерживает).
 """
 from pathlib import Path
 
 import config
 import memory
 
+
+def _fn(name: str, description: str, properties: dict, required: list[str]) -> dict:
+    """Удобный конструктор схемы инструмента в формате OpenAI."""
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+            },
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
-# Схемы инструментов (их "видит" Claude и решает, когда вызвать)
+# Схемы инструментов (их "видит" модель и решает, когда вызвать)
 # ---------------------------------------------------------------------------
 
-CLIENT_TOOLS = [
-    {
-        "name": "remember_fact",
-        "description": (
-            "Сохранить факт о пользователе в долговременную память "
-            "(имя, предпочтения, текущие дела, важные детали). "
-            "Используй, когда узнаёшь что-то, что стоит помнить в будущих диалогах."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "fact": {"type": "string", "description": "Факт одним предложением"}
-            },
-            "required": ["fact"],
+TOOLS = [
+    _fn(
+        "web_search",
+        "Найти актуальную информацию в интернете через DuckDuckGo. "
+        "Используй для свежих данных, новостей, фактов, которых ты можешь не знать.",
+        {"query": {"type": "string", "description": "Поисковый запрос"}},
+        ["query"],
+    ),
+    _fn(
+        "remember_fact",
+        "Сохранить факт о пользователе в долговременную память "
+        "(имя, предпочтения, дела, важные детали). Вызывай, когда узнаёшь что-то, "
+        "что стоит помнить в будущих диалогах.",
+        {"fact": {"type": "string", "description": "Факт одним предложением"}},
+        ["fact"],
+    ),
+    _fn(
+        "list_facts",
+        "Показать всё, что сохранено в памяти о пользователе.",
+        {},
+        [],
+    ),
+    _fn(
+        "forget_fact",
+        "Удалить факт из памяти по его номеру или по тексту.",
+        {"query": {"type": "string", "description": "Номер факта или часть текста"}},
+        ["query"],
+    ),
+    _fn(
+        "write_file",
+        "Создать или перезаписать текстовый файл-заметку в рабочей папке.",
+        {
+            "filename": {"type": "string", "description": "Имя файла, напр. 'заметки.txt'"},
+            "content": {"type": "string", "description": "Содержимое файла"},
         },
-    },
-    {
-        "name": "list_facts",
-        "description": "Показать всё, что сохранено в долговременной памяти о пользователе.",
-        "input_schema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "forget_fact",
-        "description": "Удалить факт из памяти по его номеру или по тексту.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Номер факта (например '2') или часть его текста",
-                }
-            },
-            "required": ["query"],
+        ["filename", "content"],
+    ),
+    _fn(
+        "read_file",
+        "Прочитать текстовый файл из рабочей папки.",
+        {"filename": {"type": "string", "description": "Имя файла"}},
+        ["filename"],
+    ),
+    _fn(
+        "list_files",
+        "Показать список файлов в рабочей папке.",
+        {},
+        [],
+    ),
+    _fn(
+        "set_reminder",
+        "Поставить напоминание — бот пришлёт сообщение в указанное время. "
+        "Время в ISO-формате с учётом текущей даты/времени из системного промпта, "
+        "например '2026-06-19T10:00:00'.",
+        {
+            "when": {"type": "string", "description": "Дата и время в ISO-формате"},
+            "text": {"type": "string", "description": "Текст напоминания"},
         },
-    },
-    {
-        "name": "write_file",
-        "description": (
-            "Создать или перезаписать текстовый файл в рабочей папке. "
-            "Используй для заметок, списков, черновиков."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "filename": {"type": "string", "description": "Имя файла, напр. 'заметки.txt'"},
-                "content": {"type": "string", "description": "Содержимое файла"},
-            },
-            "required": ["filename", "content"],
-        },
-    },
-    {
-        "name": "read_file",
-        "description": "Прочитать текстовый файл из рабочей папки.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "filename": {"type": "string", "description": "Имя файла"}
-            },
-            "required": ["filename"],
-        },
-    },
-    {
-        "name": "list_files",
-        "description": "Показать список файлов в рабочей папке.",
-        "input_schema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "set_reminder",
-        "description": (
-            "Поставить напоминание. Бот пришлёт сообщение в указанное время. "
-            "Время указывай в ISO-формате с учётом текущей даты/времени из системного "
-            "промпта, например '2026-06-19T10:00:00'."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "when": {"type": "string", "description": "Дата и время в ISO-формате"},
-                "text": {"type": "string", "description": "Текст напоминания"},
-            },
-            "required": ["when", "text"],
-        },
-    },
-    {
-        "name": "list_reminders",
-        "description": "Показать активные напоминания.",
-        "input_schema": {"type": "object", "properties": {}},
-    },
+        ["when", "text"],
+    ),
+    _fn(
+        "list_reminders",
+        "Показать активные напоминания.",
+        {},
+        [],
+    ),
 ]
+
+
+# ---------------------------------------------------------------------------
+# Поиск в интернете (DuckDuckGo, без ключа)
+# ---------------------------------------------------------------------------
+
+def _web_search(query: str, max_results: int = 5) -> str:
+    try:
+        from ddgs import DDGS
+    except ImportError:  # старое название пакета
+        from duckduckgo_search import DDGS  # type: ignore
+
+    with DDGS() as ddgs:
+        results = list(ddgs.text(query, max_results=max_results))
+
+    if not results:
+        return "По запросу ничего не найдено."
+
+    lines = []
+    for r in results:
+        title = r.get("title", "")
+        body = r.get("body", "")
+        href = r.get("href", "")
+        lines.append(f"• {title}\n  {body}\n  Источник: {href}")
+    return "\n\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -108,8 +127,7 @@ CLIENT_TOOLS = [
 # ---------------------------------------------------------------------------
 
 def _safe_path(filename: str) -> Path:
-    # Берём только имя файла, отбрасываем любые ../ и пути
-    name = Path(filename).name
+    name = Path(filename).name  # отбрасываем любые ../ и пути
     return config.WORKSPACE_DIR / name
 
 
@@ -140,26 +158,28 @@ def _list_files() -> str:
 # Диспетчер: выполняет инструмент по имени
 # ---------------------------------------------------------------------------
 
-def execute(name: str, tool_input: dict, ctx: dict) -> str:
-    """Выполнить клиентский инструмент. ctx содержит коллбэки от бота."""
+def execute(name: str, args: dict, ctx: dict) -> str:
+    """Выполнить инструмент. ctx содержит коллбэки от бота."""
     try:
+        if name == "web_search":
+            return _web_search(args["query"])
         if name == "remember_fact":
-            return memory.add_fact(tool_input["fact"])
+            return memory.add_fact(args["fact"])
         if name == "list_facts":
             facts = memory.list_facts()
             return "\n".join(f"{i}. {f}" for i, f in enumerate(facts, 1)) or "Память пуста."
         if name == "forget_fact":
-            return memory.forget_fact(tool_input["query"])
+            return memory.forget_fact(args["query"])
         if name == "write_file":
-            return _write_file(tool_input["filename"], tool_input["content"])
+            return _write_file(args["filename"], args["content"])
         if name == "read_file":
-            return _read_file(tool_input["filename"])
+            return _read_file(args["filename"])
         if name == "list_files":
             return _list_files()
         if name == "set_reminder":
-            return ctx["set_reminder"](tool_input["when"], tool_input["text"])
+            return ctx["set_reminder"](args["when"], args["text"])
         if name == "list_reminders":
             return ctx["list_reminders"]()
         return f"Неизвестный инструмент: {name}"
-    except Exception as e:  # noqa: BLE001 — возвращаем ошибку модели как текст
+    except Exception as e:  # noqa: BLE001 — отдаём ошибку модели как текст
         return f"Ошибка при выполнении '{name}': {e}"

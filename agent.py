@@ -1,16 +1,18 @@
-"""Агентный цикл: общение с Claude API и обработка инструментов."""
+"""Агентный цикл: общение с моделью (Fireworks, OpenAI-совместимый API)
+и обработка инструментов."""
+import json
 from datetime import datetime
 
-from anthropic import AsyncAnthropic
+from openai import AsyncOpenAI
 
 import config
 import memory
 import tools
 
-client = AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
-
-# Серверный инструмент поиска в интернете (выполняется на стороне Anthropic)
-WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}
+client = AsyncOpenAI(
+    api_key=config.FIREWORKS_API_KEY,
+    base_url=config.FIREWORKS_BASE_URL,
+)
 
 MAX_TOKENS = 2048
 MAX_TOOL_ROUNDS = 8  # защита от бесконечного цикла вызовов инструментов
@@ -25,64 +27,61 @@ def build_system_prompt() -> str:
         f"Текущие дата и время: {now.strftime('%Y-%m-%d %H:%M:%S %Z')} "
         f"(день недели: {now.strftime('%A')}).\n"
         "Используй это время для вычисления моментов напоминаний.\n\n"
-        "Что ты умеешь через инструменты:\n"
-        "- искать актуальную информацию в интернете (web_search);\n"
-        "- запоминать и забывать факты о пользователе (remember_fact / forget_fact / list_facts);\n"
-        "- создавать и читать файлы-заметки (write_file / read_file / list_files);\n"
-        "- ставить напоминания (set_reminder / list_reminders).\n\n"
-        "Сам решай, когда стоит что-то запомнить — без лишних вопросов.\n\n"
+        "Доступные инструменты:\n"
+        "- web_search — искать актуальную информацию в интернете;\n"
+        "- remember_fact / forget_fact / list_facts — память о пользователе;\n"
+        "- write_file / read_file / list_files — заметки и файлы;\n"
+        "- set_reminder / list_reminders — напоминания.\n\n"
+        "Сам решай, когда стоит что-то запомнить или поискать — без лишних вопросов.\n\n"
         "Что ты уже знаешь о пользователе:\n"
         f"{memory.memory_block()}"
     )
 
 
 async def run(history: list[dict], user_text: str, ctx: dict) -> str:
-    """Обрабатывает одно сообщение пользователя.
-
-    history мутируется (добавляются новые сообщения). Возвращает текст ответа.
-    """
+    """Обрабатывает одно сообщение. history мутируется. Возвращает текст ответа."""
     history.append({"role": "user", "content": user_text})
 
-    all_tools = [WEB_SEARCH_TOOL] + tools.CLIENT_TOOLS
-
     for _ in range(MAX_TOOL_ROUNDS):
-        response = await client.messages.create(
-            model=config.CLAUDE_MODEL,
+        response = await client.chat.completions.create(
+            model=config.MODEL,
             max_tokens=MAX_TOKENS,
-            system=build_system_prompt(),
-            tools=all_tools,
-            messages=history,
+            messages=[{"role": "system", "content": build_system_prompt()}] + history,
+            tools=tools.TOOLS,
         )
+        msg = response.choices[0].message
+        history.append(_assistant_to_dict(msg))
 
-        # Сохраняем ответ ассистента в историю
-        history.append({"role": "assistant", "content": response.content})
+        if not msg.tool_calls:
+            return (msg.content or "").strip() or "(пустой ответ)"
 
-        if response.stop_reason != "tool_use":
-            return _extract_text(response.content) or "(пустой ответ)"
-
-        # Выполняем все клиентские инструменты, которые запросила модель
-        tool_results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                result = tools.execute(block.name, block.input, ctx)
-                tool_results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result,
-                    }
-                )
-
-        if not tool_results:
-            # Запрошены только серверные инструменты (web_search) — модель
-            # продолжит сама на следующем шаге не должна сюда попасть, но на всякий случай
-            return _extract_text(response.content) or "(пустой ответ)"
-
-        history.append({"role": "user", "content": tool_results})
+        # Выполняем все запрошенные инструменты
+        for tc in msg.tool_calls:
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            result = tools.execute(tc.function.name, args, ctx)
+            history.append(
+                {"role": "tool", "tool_call_id": tc.id, "content": result}
+            )
 
     return "Слишком много шагов с инструментами — останавливаюсь. Попробуй переформулировать."
 
 
-def _extract_text(content) -> str:
-    parts = [b.text for b in content if getattr(b, "type", None) == "text"]
-    return "\n".join(parts).strip()
+def _assistant_to_dict(msg) -> dict:
+    """Превращает ответ модели в обычный dict для истории."""
+    out: dict = {"role": "assistant", "content": msg.content or ""}
+    if msg.tool_calls:
+        out["tool_calls"] = [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments,
+                },
+            }
+            for tc in msg.tool_calls
+        ]
+    return out
